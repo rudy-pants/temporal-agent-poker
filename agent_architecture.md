@@ -1,4 +1,4 @@
-# Agent Memory Architecture
+# Agent Architecture
 
 The Claude poker agent has a **file-system-based memory** that it owns and
 structures itself. The objective is to get better at poker by playing and
@@ -6,7 +6,8 @@ observing games over time.
 
 This document is a module-level companion to
 [poker_game_architecture.md](poker_game_architecture.md). The main architecture
-keeps the system overview; this file owns the agent memory details.
+keeps the system overview; this file owns all agent decision-making, model-call,
+resilience, tool-loop, and memory details.
 
 ---
 
@@ -27,10 +28,199 @@ belongs under `activities/`.
 
 | Code | Target location | Purpose |
 |------|-----------------|---------|
-| Agent tool loop workflow helpers | `workflows/agent_memory.py` | Route Claude tool calls to memory activities |
-| Post-hand reflection workflow helper | `workflows/agent_memory.py` | Let Claude inspect and update memory after a hand |
-| Claude model-call activity | `activities/claude.py` | Call the model once and return either an action or a tool call |
+| Agent tool loop workflow helpers | `workflows/agent.py` | Route Claude tool calls to memory activities |
+| Post-hand reflection workflow helper | `workflows/agent.py` | Let Claude inspect and update memory after a hand |
+| Claude model-call activity | `activities/agent.py` | Call the model once and return either an action or a tool call |
 | Memory filesystem activities | `activities/agent_memory.py` | List, read, write, and targeted-edit memory files |
+
+---
+
+## Agent Decision Model
+
+The production design runs Claude as a Temporal activity invoked by the game
+workflow. The workflow owns turn order and timeouts; the agent activity owns
+model interaction, action parsing, tool calls, retries, and fallback behavior.
+
+For early CLI-only prototypes, the same prompt/parsing logic can be wrapped in a
+plain `ClaudePokerAgent` class. That class is agent code and should live with
+the agent module, not in the poker workflow or UI architecture.
+
+---
+
+## CLI Prototype Agent
+
+Target file: `activities/agent.py` or a prototype-only module under `agents/`
+
+```python
+import anthropic
+
+
+class ClaudePokerAgent:
+    """Claude Opus 4.7 as a poker player."""
+
+    def __init__(self, player_index: int):
+        self.client = anthropic.Anthropic()
+        self.model = "claude-opus-4-7-20250506"
+        self.player_index = player_index
+
+    async def act(self, obs: Observation, valid_actions: list[Action]) -> Action:
+        prompt = self._build_prompt(obs, valid_actions)
+
+        response = self.client.messages.create(
+            model=self.model,
+            max_tokens=256,
+            system=(
+                "You are an expert poker player. Analyze the situation and "
+                "choose the optimal action. Respond with ONLY one of: "
+                "fold | check_or_call | raise <amount>"
+            ),
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        return self._parse_response(response.content[0].text, valid_actions)
+
+    def _build_prompt(self, obs: Observation, valid_actions: list[Action]) -> str:
+        return f"""Current poker situation:
+
+Your hand: {obs.hole_cards}
+Community cards: {obs.board_cards or "None"}
+Pot: {obs.pot}
+Your stack: {obs.stacks[self.player_index]}
+Amount to call: {obs.current_bet}
+Min raise to: {obs.min_raise}
+Max raise to: {obs.max_raise}
+Street: {obs.street}
+
+Action history:
+{self._format_history(obs.history)}
+
+Valid actions: {[f"{a.type}" + (f" {a.amount}" if a.amount else "") for a in valid_actions]}
+
+What is your action?"""
+
+    def _format_history(self, history: list[ActionRecord]) -> str:
+        if not history:
+            return "  (none yet)"
+        lines = []
+        for rec in history:
+            amt = f" to {rec.action.amount}" if rec.action.amount else ""
+            lines.append(f"  Player {rec.player_index}: {rec.action.type}{amt} ({rec.street})")
+        return "\n".join(lines)
+
+    def _parse_response(self, text: str, valid_actions: list[Action]) -> Action:
+        text = text.strip().lower()
+        if "fold" in text:
+            return Action("fold")
+        elif "raise" in text:
+            parts = text.split()
+            for part in parts:
+                try:
+                    amount = int(part)
+                    return Action("raise", amount)
+                except ValueError:
+                    continue
+            raise_actions = [a for a in valid_actions if a.type == "raise"]
+            return raise_actions[0] if raise_actions else Action("check_or_call")
+        else:
+            return Action("check_or_call")
+```
+
+---
+
+## Claude Activity
+
+Moving Claude from an external polling client to a workflow activity simplifies
+the runtime architecture:
+
+- The workflow controls Claude's turn directly.
+- Timeouts on Claude are handled by activity timeout.
+- The human/browser is the only external gameplay client.
+- Agent retries and fallback behavior are isolated in activity code.
+
+Target file: `activities/agent.py`
+
+```python
+from temporalio import activity
+import anthropic
+
+
+@activity.defn
+async def claude_decide(obs_dict: dict, valid_actions_dict: list[dict]) -> dict:
+    """Activity: ask Claude for a poker decision."""
+    client = anthropic.AsyncAnthropic()
+
+    prompt = _build_prompt(obs_dict, valid_actions_dict)
+
+    response = await client.messages.create(
+        model="claude-opus-4-7-20250506",
+        max_tokens=256,
+        system=(
+            "You are an expert poker player. Analyze the situation and "
+            "choose the optimal action. Respond with ONLY one of: "
+            "fold | check_or_call | raise <amount>"
+        ),
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    text = response.content[0].text.strip().lower()
+    return _parse_to_dict(text, valid_actions_dict)
+```
+
+Target file: `workflows/poker_game.py`
+
+```python
+if actor == CLAUDE_INDEX:
+    obs_dict = self._build_obs_dict(actor)
+    valid_dict = self._build_valid_actions_dict(actor)
+    try:
+        action_dict = await workflow.execute_activity(
+            claude_decide,
+            args=[obs_dict, valid_dict],
+            start_to_close_timeout=timedelta(seconds=15),
+            retry_policy=RetryPolicy(maximum_attempts=2),
+        )
+        action = Action(**action_dict)
+    except ActivityError:
+        action = Action("check_or_call")
+    self._apply_action(actor, action)
+```
+
+---
+
+## Agent Resilience
+
+The Claude API can timeout, return 500s, or produce unparseable responses. The
+agent activity should retry briefly, validate the returned action against the
+legal action set, and fall back to a safe action.
+
+```python
+class ClaudePokerAgent:
+    MAX_RETRIES = 2
+    TIMEOUT = 10  # seconds
+
+    async def act(self, obs: Observation, valid_actions: list[Action]) -> Action:
+        for attempt in range(self.MAX_RETRIES + 1):
+            try:
+                response = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=256,
+                    timeout=self.TIMEOUT,
+                    system="...",
+                    messages=[{"role": "user", "content": self._build_prompt(obs, valid_actions)}],
+                )
+                action = self._parse_response(response.content[0].text, valid_actions)
+                if action.type == "raise" and action.amount > 0:
+                    valid_raise = any(a.type == "raise" for a in valid_actions)
+                    if not valid_raise:
+                        return Action("check_or_call")
+                return action
+            except (anthropic.APITimeoutError, anthropic.APIError):
+                if attempt < self.MAX_RETRIES:
+                    continue
+                return Action("check_or_call")
+            except Exception:
+                return Action("check_or_call")
+```
 
 ---
 
@@ -99,7 +289,7 @@ improve.
 
 ## Workflow Integration
 
-Target file: `workflows/agent_memory.py`
+Target file: `workflows/agent.py`
 
 ```python
 async def claude_agent_turn(
@@ -150,7 +340,7 @@ async def execute_memory_tool(agent_id: str, tool_call: dict) -> dict | str | No
     raise ValueError(f"Unknown memory tool: {tool_call['name']}")
 ```
 
-Target file: `activities/claude.py`
+Target file: `activities/agent.py`
 
 ```python
 @activity.defn
@@ -302,7 +492,7 @@ retry/error handling.
 
 ## Post-Hand Reflection Flow
 
-Target file: `workflows/agent_memory.py`
+Target file: `workflows/agent.py`
 
 ```python
 async def claude_reflect(

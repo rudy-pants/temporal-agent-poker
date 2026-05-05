@@ -31,7 +31,7 @@ Using **PokerKit** as the authoritative game engine, **Temporal** for workflow o
 │  │ localhost:7233         │        │ worker.py                           │  │
 │  │ - Durable event log    │        │ - Registers workflows/              │  │
 │  │ - Timers               │        │ - Registers activities/             │  │
-│  │ - Workflow state       │        │ - Calls PokerKit + Claude tools     │  │
+│  │ - Workflow state       │        │ - Runs PokerKit + agent module      │  │
 │  └────────────────────────┘        └──────────────────┬──────────────────┘  │
 │                                                        │                     │
 │                          ┌─────────────────────────────┼──────────────────┐  │
@@ -40,7 +40,7 @@ Using **PokerKit** as the authoritative game engine, **Temporal** for workflow o
 │              ┌──────────────────────┐      ┌───────────────────────────┐  │  │
 │              │ workflows/           │      │ activities/               │  │  │
 │              │ - PokerGameWorkflow  │      │ - Claude model calls      │  │  │
-│              │ - Agent tool loop    │      │ - Memory file operations  │  │  │
+│              │ - Agent turn hooks   │      │ - Memory file operations  │  │  │
 │              │ - Signals / queries  │      │ - External side effects   │  │  │
 │              └──────────┬───────────┘      └─────────────┬─────────────┘  │  │
 │                         │                                │                │  │
@@ -61,11 +61,11 @@ Using **PokerKit** as the authoritative game engine, **Temporal** for workflow o
 |--------|----------|----------------|
 | Temporal dev server | local process | Durable workflow history, timers, replay, and task queues |
 | Temporal worker | `worker.py` | Registers every workflow from `workflows/` and every activity from `activities/` |
-| Game workflows | `workflows/` | Authoritative game orchestration, signals, queries, turn timers, and agent tool loops |
+| Game workflows | `workflows/` | Authoritative game orchestration, signals, queries, turn timers, and agent module hooks |
 | Activities | `activities/` | External effects: Claude calls, memory filesystem operations, server notifications |
 | Frontend client | `frontend/` | Human gameplay UI, live state display, action submission |
 | WebSocket server | `server/` | Browser bridge to Temporal signals and queries |
-| Agent memory | `memory/agents/{agent_id}/` | Persistent model-owned files; see [agent_memory_architecture.md](agent_memory_architecture.md) |
+| Agent module | `workflows/agent.py`, `activities/agent.py`, `activities/agent_memory.py` | Claude decisions, tool loop, resilience, and memory; see [agent_architecture.md](agent_architecture.md) |
 
 ### Code Placement Rule
 
@@ -462,94 +462,14 @@ class PokerEnv:
 
 ---
 
-## Claude Agent (Player 1)
+## Agent Module
 
-```python
-import anthropic
+The AI player is a separate architecture module. It owns Claude prompts, model
+calls, action parsing, retry/fallback behavior, memory tool loops, and persistent
+filesystem memory under `memory/agents/{agent_id}/`.
 
-
-class ClaudePokerAgent:
-    """Claude Opus 4.7 as a poker player."""
-
-    def __init__(self, player_index: int):
-        self.client = anthropic.Anthropic()
-        self.model = "claude-opus-4-7-20250506"
-        self.player_index = player_index
-
-    async def act(self, obs: Observation, valid_actions: list[Action]) -> Action:
-        prompt = self._build_prompt(obs, valid_actions)
-
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=256,
-            system=(
-                "You are an expert poker player. Analyze the situation and "
-                "choose the optimal action. Respond with ONLY one of: "
-                "fold | check_or_call | raise <amount>"
-            ),
-            messages=[{"role": "user", "content": prompt}],
-        )
-
-        return self._parse_response(response.content[0].text, valid_actions)
-
-    def _build_prompt(self, obs: Observation, valid_actions: list[Action]) -> str:
-        return f"""Current poker situation:
-
-Your hand: {obs.hole_cards}
-Community cards: {obs.board_cards or "None"}
-Pot: {obs.pot}
-Your stack: {obs.stacks[self.player_index]}
-Amount to call: {obs.current_bet}
-Min raise to: {obs.min_raise}
-Max raise to: {obs.max_raise}
-Street: {obs.street}
-
-Action history:
-{self._format_history(obs.history)}
-
-Valid actions: {[f"{a.type}" + (f" {a.amount}" if a.amount else "") for a in valid_actions]}
-
-What is your action?"""
-
-    def _format_history(self, history: list[ActionRecord]) -> str:
-        if not history:
-            return "  (none yet)"
-        lines = []
-        for rec in history:
-            amt = f" to {rec.action.amount}" if rec.action.amount else ""
-            lines.append(f"  Player {rec.player_index}: {rec.action.type}{amt} ({rec.street})")
-        return "\n".join(lines)
-
-    def _parse_response(self, text: str, valid_actions: list[Action]) -> Action:
-        text = text.strip().lower()
-        if "fold" in text:
-            return Action("fold")
-        elif "raise" in text:
-            parts = text.split()
-            for part in parts:
-                try:
-                    amount = int(part)
-                    return Action("raise", amount)
-                except ValueError:
-                    continue
-            # Default to min raise
-            raise_actions = [a for a in valid_actions if a.type == "raise"]
-            return raise_actions[0] if raise_actions else Action("check_or_call")
-        else:
-            return Action("check_or_call")
-```
-
----
-
-## Agent Memory Module
-
-The Claude agent uses persistent filesystem memory rooted at
-`memory/agents/{agent_id}/`. Memory is not loaded wholesale into model context.
-Instead, Claude receives memory tools and can list, read, write, or targeted-edit
-files through Temporal activities.
-
-Detailed memory architecture, tool flows, and activity definitions live in
-[agent_memory_architecture.md](agent_memory_architecture.md).
+All agent code and detailed agent architecture live in
+[agent_architecture.md](agent_architecture.md).
 
 ---
 
@@ -611,10 +531,7 @@ async def main():
     client = await Client.connect("localhost:7233")
 
     human_env = PokerEnv(client, player_index=0)
-    claude_env = PokerEnv(client, player_index=1)
-
     human = HumanPlayer(player_index=0)
-    claude = ClaudePokerAgent(player_index=1)
 
     session_stacks = [200, 200]
 
@@ -629,8 +546,6 @@ async def main():
         }
 
         obs = await human_env.reset(game_id=game_id, config=config)
-        # Claude connects to the same workflow
-        claude_env.handle = human_env.handle
 
         while not obs.terminal:
             if obs.is_my_turn:
@@ -638,12 +553,7 @@ async def main():
                 action = await human.act(obs, valid)
                 obs, reward, done, info = await human_env.step(action)
             else:
-                # Claude's turn
-                claude_obs = await claude_env.observe()
-                valid = await claude_env.action_space()
-                action = await claude.act(claude_obs, valid)
-                await claude_env.step(action)
-                # Refresh human view
+                # AI turns are handled inside the workflow through the agent module.
                 obs = await human_env.observe()
 
         # Hand complete
@@ -902,42 +812,13 @@ async def _wait_for_turn(self) -> Observation:
 
 ---
 
-### 7. Claude Agent Resilience
+### 7. Agent Resilience
 
-**Problem**: The Claude API can timeout, return 500s, or produce unparseable responses. The agent currently has no error handling.
+**Problem**: The model API can timeout, return 500s, or produce unparseable
+responses.
 
-**Fix**: Retry with fallback.
-
-```python
-class ClaudePokerAgent:
-    MAX_RETRIES = 2
-    TIMEOUT = 10  # seconds
-
-    async def act(self, obs: Observation, valid_actions: list[Action]) -> Action:
-        for attempt in range(self.MAX_RETRIES + 1):
-            try:
-                response = self.client.messages.create(
-                    model=self.model,
-                    max_tokens=256,
-                    timeout=self.TIMEOUT,
-                    system="...",
-                    messages=[{"role": "user", "content": self._build_prompt(obs, valid_actions)}],
-                )
-                action = self._parse_response(response.content[0].text, valid_actions)
-                # Validate the action is actually in the valid set
-                if action.type == "raise" and action.amount > 0:
-                    valid_raise = any(a.type == "raise" for a in valid_actions)
-                    if not valid_raise:
-                        return Action("check_or_call")
-                return action
-            except (anthropic.APITimeoutError, anthropic.APIError) as e:
-                if attempt < self.MAX_RETRIES:
-                    continue
-                # Final fallback: check/call is safe
-                return Action("check_or_call")
-            except Exception:
-                return Action("check_or_call")
-```
+**Fix**: Agent retry, validation, and fallback behavior belongs in
+[agent_architecture.md](agent_architecture.md), not in the poker workflow.
 
 ---
 
@@ -1053,15 +934,15 @@ A single-page React app connected to a FastAPI backend via WebSocket. Designed f
                               └────────────────────┬───────────────────┘
                                                    │
                                           ┌────────▼────────┐
-                                          │  Claude Agent   │
-                                          │  (Activity)     │
+                                          │  Agent Module   │
+                                          │  (Activities)   │
                                           └─────────────────┘
 ```
 
-Key change: Claude runs as a **Temporal Activity** invoked by the workflow, not as an external client. This means:
-- The workflow controls Claude's turn directly (no second polling client)
-- Timeouts on Claude are handled by activity timeout, not a separate timer
-- The human is the only external client
+Key change: the AI player runs through the **Agent Module** invoked by the
+workflow, not as an external client. The workflow controls turn order and
+timeouts; agent implementation details live in
+[agent_architecture.md](agent_architecture.md).
 
 ---
 
@@ -1162,76 +1043,11 @@ def obs_to_dict(obs: Observation) -> dict:
 
 ---
 
-### Claude as Activity (not external client)
+### Agent Integration
 
-Moving Claude from an external polling client to a workflow activity simplifies the architecture significantly:
-
-Target file: `activities/claude.py`
-
-```python
-from temporalio import activity
-import anthropic
-
-
-@activity.defn
-async def claude_decide(obs_dict: dict, valid_actions_dict: list[dict]) -> dict:
-    """Activity: ask Claude for a poker decision."""
-    client = anthropic.AsyncAnthropic()
-
-    prompt = _build_prompt(obs_dict, valid_actions_dict)
-
-    response = await client.messages.create(
-        model="claude-opus-4-7-20250506",
-        max_tokens=256,
-        system=(
-            "You are an expert poker player. Analyze the situation and "
-            "choose the optimal action. Respond with ONLY one of: "
-            "fold | check_or_call | raise <amount>"
-        ),
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    text = response.content[0].text.strip().lower()
-    return _parse_to_dict(text, valid_actions_dict)
-```
-
-In the workflow, Claude's turn becomes:
-
-Target file: `workflows/poker_game.py`
-
-```python
-while self.state.status:
-    actor = self.state.actor_index
-    if actor is None:
-        break
-
-    if actor == CLAUDE_INDEX:
-        # Claude decides via activity (with timeout)
-        obs_dict = self._build_obs_dict(actor)
-        valid_dict = self._build_valid_actions_dict(actor)
-        try:
-            action_dict = await workflow.execute_activity(
-                claude_decide,
-                args=[obs_dict, valid_dict],
-                start_to_close_timeout=timedelta(seconds=15),
-                retry_policy=RetryPolicy(maximum_attempts=2),
-            )
-            action = Action(**action_dict)
-        except ActivityError:
-            action = Action("check_or_call")
-        self._apply_action(actor, action)
-    else:
-        # Human: wait for signal with timeout
-        try:
-            await workflow.wait_condition(
-                lambda: self._has_action_from(actor),
-                timeout=TURN_TIMEOUT,
-            )
-            action = self._pop_action_from(actor)
-        except asyncio.TimeoutError:
-            action = Action("fold")
-        self._apply_action(actor, action)
-```
+The workflow invokes the agent module when the AI seat is the current actor. All
+Claude-specific activity code, prompts, action parsing, memory tools, retries,
+and fallbacks are specified in [agent_architecture.md](agent_architecture.md).
 
 ---
 
@@ -1396,11 +1212,11 @@ poker_temporal/
 ├── workflows/
 │   ├── __init__.py
 │   ├── poker_game.py          # PokerGameWorkflow wrapping PokerKit
-│   ├── agent_memory.py        # Claude tool loop + reflection workflow helpers
+│   ├── agent.py               # Agent turn + reflection workflow helpers
 │   └── types.py               # Observation, Action, ActionRecord
 ├── activities/
 │   ├── __init__.py
-│   ├── claude.py              # Claude model-call activities
+│   ├── agent.py               # Claude model-call activities
 │   ├── agent_memory.py        # Memory list/read/write/edit activities
 │   └── notifications.py       # Optional UI notification activities
 ├── env/
