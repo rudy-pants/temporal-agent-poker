@@ -5,13 +5,129 @@ Play No-Limit Texas Hold'em against a GPT-powered AI agent, orchestrated by Temp
 ## Architecture
 
 ```
-Browser (React) ←── WebSocket ──→ FastAPI Server ←── Temporal Client ──→ Temporal Workflow
-                                                                              │
-                                                                         PokerKit State
-                                                                              │
-                                                                    GPT Agent (Activity)
-                                                                              │
-                                                                     Memory Filesystem
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                                    BROWSER                                           │
+│                              React + Vite (localhost:5173)                           │
+│                                                                                     │
+│   ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌───────────────────────┐  │
+│   │ Poker Table  │  │ Action Panel │  │  Event Log   │  │  GPT Action Display   │  │
+│   └──────────────┘  └──────────────┘  └──────────────┘  └───────────────────────┘  │
+└───────────────────────────────────┬─────────────────────────────────────────────────┘
+                                    │ WebSocket (actions ↑ state ↓)
+                                    │
+┌───────────────────────────────────▼─────────────────────────────────────────────────┐
+│                          FastAPI SERVER (localhost:8000)                              │
+│                   Bridges browser ←→ Temporal (signals + queries)                    │
+└───────────────────────────────────┬─────────────────────────────────────────────────┘
+                                    │ Temporal Client SDK
+                                    │
+┌═══════════════════════════════════▼═════════════════════════════════════════════════╗
+║                                                                                     ║
+║                    TEMPORAL  (localhost:7233 / UI at :8233)                         ║
+║                                                                                     ║
+║  ┌────────────────────────────────────────────────────────────────────────────┐     ║
+║  │                   WORKFLOW: PokerGameWorkflow                               │     ║
+║  │                                                                            │     ║
+║  │  ┌─────────────────────────────────────────────────────────────────────┐  │     ║
+║  │  │  POKERKIT STATE (game rules, cards, pots, evaluation)               │  │     ║
+║  │  └─────────────────────────────────────────────────────────────────────┘  │     ║
+║  │                                                                            │     ║
+║  │  Game Loop:                                                                │     ║
+║  │    ┌─────────┐     ┌──────────────────────┐     ┌──────────────────────┐ │     ║
+║  │    │ Actor?  │────▶│ Human? wait_condition │────▶│ GPT? execute_activity│ │     ║
+║  │    └─────────┘     │ (signal + 30s timer)  │     │ (gpt_decide)        │ │     ║
+║  │         ▲          └──────────┬───────────┘     └──────────┬───────────┘ │     ║
+║  │         │                     │                             │             │     ║
+║  │         └─────────────────────┴─────── apply action ────────┘             │     ║
+║  │                                                                            │     ║
+║  │  After hand:                                                               │     ║
+║  │    reflect (activity) → update running notes → continue_as_new             │     ║
+║  │                                                                            │     ║
+║  │  Game over:                                                                │     ║
+║  │    compress learnings (activity) → write to memory filesystem              │     ║
+║  │                                                                            │     ║
+║  └────────────────────────────────────────────────────────────────────────────┘     ║
+║                                                                                     ║
+║  ┌─────────────────────────────────────────────────────────────────────────────┐    ║
+║  │  TEMPORAL PROVIDES:                                                          │    ║
+║  │                                                                             │    ║
+║  │  • Signals ──────── player actions (fold/call/raise) into workflow          │    ║
+║  │  • Queries ──────── read game state without blocking (observations)         │    ║
+║  │  • Timers ───────── 30s turn timeout → auto-fold (durable, survives crash) │    ║
+║  │  • Activities ───── GPT API calls with retry + timeout                      │    ║
+║  │  • Replay ───────── crash mid-hand? restart worker, game continues          │    ║
+║  │  • Continue-as-new─ multi-hand sessions, bounded memory                     │    ║
+║  │  • Event History ── full audit trail of every action + GPT decision         │    ║
+║  │                                                                             │    ║
+║  └─────────────────────────────────────────────────────────────────────────────┘    ║
+║                                                                                     ║
+╚═════════════════════════════════════════════════════════════════════════════════════╝
+                                    │
+                          Activities│(GPT API calls)
+                                    │
+┌───────────────────────────────────▼─────────────────────────────────────────────────┐
+│                              OPENAI API                                              │
+│                                                                                     │
+│   ┌─────────────────┐  ┌────────────────────┐  ┌─────────────────────────────────┐ │
+│   │  gpt_decide     │  │ gpt_reflect_hand   │  │  gpt_compress_learnings         │ │
+│   │                 │  │                    │  │                                 │ │
+│   │ Pick action     │  │ Update running     │  │ Distill session notes into      │ │
+│   │ (fold/call/     │  │ notes after each   │  │ compact persistent learnings    │ │
+│   │  raise)         │  │ hand (in-memory)   │  │ (writes to filesystem)          │ │
+│   └─────────────────┘  └────────────────────┘  └──────────────────┬──────────────┘ │
+└─────────────────────────────────────────────────────────────────────┼────────────────┘
+                                                                      │
+                                                                      ▼
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         AGENT MEMORY FILESYSTEM                                      │
+│                         memory/agents/gpt-default/                                   │
+│                                                                                     │
+│   ┌─────────────────┐  ┌──────────────────────────┐  ┌───────────────────────────┐ │
+│   │  strategy.md    │  │  opponents/               │  │  learnings.md             │ │
+│   │                 │  │    session_notes.md        │  │                           │ │
+│   │  Self-defined   │  │                            │  │  General insights from    │ │
+│   │  poker strategy │  │  Compressed opponent       │  │  past sessions            │ │
+│   │  (evolves over  │  │  profiles from past games  │  │                           │ │
+│   │  sessions)      │  │                            │  │                           │ │
+│   └─────────────────┘  └──────────────────────────┘  └───────────────────────────┘ │
+│                                                                                     │
+│   Agent defines its own structure. Files persist across games.                       │
+│   Loaded into GPT's system prompt at the start of each session.                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         DATA FLOW (one turn)                                         │
+│                                                                                     │
+│  1. Player clicks "Raise $20"                                                       │
+│  2. Browser → WebSocket → FastAPI → signal(player_action, {raise, 20})              │
+│  3. Workflow: wait_condition unblocks → PokerKit applies action → street advances   │
+│  4. Workflow: actor is now GPT → execute_activity(gpt_decide)                       │
+│  5. GPT activity: loads memory + running notes → calls OpenAI → returns action      │
+│  6. Workflow: applies GPT action → PokerKit deals next card if street complete      │
+│  7. FastAPI: polls query(get_observation) → pushes state_update over WebSocket      │
+│  8. Browser: re-renders table with new cards, pot, GPT's action badge              │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+
+
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                         MEMORY LIFECYCLE                                              │
+│                                                                                     │
+│  Hand 1: GPT plays → (no notes yet)                                                │
+│  Hand 1 ends: gpt_reflect_hand → "Opponent raised big with weak hand"              │
+│                                                                                     │
+│  Hand 2: GPT plays → (sees running notes: "opponent is aggressive")                │
+│  Hand 2 ends: gpt_reflect_hand → appends "Opponent bluffs river frequently"        │
+│                                                                                     │
+│  Hand 3-N: Notes accumulate in-memory, passed via continue_as_new                  │
+│                                                                                     │
+│  Game Over (someone busted):                                                        │
+│    gpt_compress_learnings → distills notes → writes strategy.md, learnings.md      │
+│                                                                                     │
+│  Next Game: GPT loads persistent files → starts with prior knowledge               │
+│                                                                                     │
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 - **PokerKit** — game rules, dealing, pot math, hand evaluation
