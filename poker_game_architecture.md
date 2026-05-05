@@ -4,7 +4,7 @@
 
 Build a turn-based poker game where:
 - **Player 1**: Human (CLI/web interface)
-- **Player 2**: AI agent (Claude Opus 4.7)
+- **Player 2**: AI agent (OpenAI GPT model)
 
 Using **PokerKit** as the authoritative game engine, **Temporal** for workflow orchestration, and an **OpenAI Gym-style interface** for both players.
 
@@ -28,7 +28,7 @@ Using **PokerKit** as the authoritative game engine, **Temporal** for workflow o
             └──────┬──────┘         └──────┴──────┘
                    │                       │
             ┌──────┴──────┐         ┌──────┴──────┐
-            │ Human (CLI) │         │ Claude 4.7  │
+            │ Human (CLI) │         │  GPT Agent  │
             └─────────────┘         └─────────────┘
 
 Inside the Workflow:
@@ -59,7 +59,7 @@ Temporal is the **game server** — it holds authoritative state, serializes acc
 
 **What Temporal does NOT do here:**
 - Poker rules → PokerKit
-- AI decision-making → Claude
+- AI decision-making → OpenAI GPT
 - Player-facing interface → CLI/web layer
 
 ```
@@ -69,7 +69,7 @@ Temporal is the **game server** — it holds authoritative state, serializes acc
 │   PokerKit      │     Temporal         │   Agents / UI          │
 ├─────────────────┼──────────────────────┼────────────────────────┤
 │ Shuffle & deal  │ Durable state        │ Human CLI input        │
-│ Betting rules   │ Turn serialization   │ Claude API calls       │
+│ Betting rules   │ Turn serialization   │ OpenAI API calls       │
 │ Pot math        │ Crash recovery       │ Display / rendering    │
 │ Hand evaluation │ Turn timers          │ Action parsing         │
 │ Street logic    │ Event history        │ Session management     │
@@ -428,35 +428,40 @@ class PokerEnv:
 
 ---
 
-## Claude Agent (Player 1)
+## GPT Agent (Player 1)
 
 ```python
-import anthropic
+from openai import AsyncOpenAI
 
 
-class ClaudePokerAgent:
-    """Claude Opus 4.7 as a poker player."""
+class GPTPokerAgent:
+    """OpenAI GPT as a poker player."""
 
-    def __init__(self, player_index: int):
-        self.client = anthropic.Anthropic()
-        self.model = "claude-opus-4-7-20250506"
+    def __init__(self, player_index: int, model: str = "gpt-4o"):
+        self.client = AsyncOpenAI()
+        self.model = model
         self.player_index = player_index
 
     async def act(self, obs: Observation, valid_actions: list[Action]) -> Action:
         prompt = self._build_prompt(obs, valid_actions)
 
-        response = self.client.messages.create(
+        response = await self.client.chat.completions.create(
             model=self.model,
             max_tokens=256,
-            system=(
-                "You are an expert poker player. Analyze the situation and "
-                "choose the optimal action. Respond with ONLY one of: "
-                "fold | check_or_call | raise <amount>"
-            ),
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert poker player. Analyze the situation and "
+                        "choose the optimal action. Respond with ONLY one of: "
+                        "fold | check_or_call | raise <amount>"
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
         )
 
-        return self._parse_response(response.content[0].text, valid_actions)
+        return self._parse_response(response.choices[0].message.content, valid_actions)
 
     def _build_prompt(self, obs: Observation, valid_actions: list[Action]) -> str:
         return f"""Current poker situation:
@@ -498,7 +503,6 @@ What is your action?"""
                     return Action("raise", amount)
                 except ValueError:
                     continue
-            # Default to min raise
             raise_actions = [a for a in valid_actions if a.type == "raise"]
             return raise_actions[0] if raise_actions else Action("check_or_call")
         else:
@@ -509,7 +513,7 @@ What is your action?"""
 
 ## Agent Memory (Self-Organizing)
 
-The Claude agent has a **file-system-based memory** that it owns and structures itself. The objective: get better at poker by playing and observing games over time.
+The GPT agent has a **file-system-based memory** that it owns and structures itself. The objective: get better at poker by playing and observing games over time.
 
 ### Design Principles
 
@@ -523,7 +527,7 @@ The Claude agent has a **file-system-based memory** that it owns and structures 
 ```
 memory/
 └── agents/
-    └── {AGENT_NAME_ID}/           # e.g., "claude-A8CD3/"
+    └── {AGENT_NAME_ID}/           # e.g., "gpt-A8CD3/"
         ├── SYSTEM_PROMPT.md       # Agent's self-defined identity + goals
         └── ... (agent-defined)    # Agent creates its own structure below
 ```
@@ -555,7 +559,7 @@ memory/
 On first run, the agent might create something like:
 
 ```
-memory/agents/claude-A8CD3/
+memory/agents/gpt-A8CD3/
 ├── SYSTEM_PROMPT.md              # "I am a poker agent. My goal is to..."
 ├── strategy/
 │   ├── preflop_ranges.md         # Opening hand ranges by position
@@ -578,9 +582,9 @@ But this is **not prescribed** — the agent creates whatever structure helps it
 
 ```python
 @activity.defn
-async def claude_decide(obs_dict: dict, valid_actions_dict: list[dict], agent_id: str) -> dict:
-    """Activity: ask Claude for a poker decision, with memory."""
-    client = anthropic.AsyncAnthropic()
+async def gpt_decide(obs_dict: dict, valid_actions_dict: list[dict], agent_id: str) -> dict:
+    """Activity: ask GPT for a poker decision, with memory."""
+    client = AsyncOpenAI()
     memory_path = f"memory/agents/{agent_id}"
 
     # Load memory into context
@@ -589,11 +593,13 @@ async def claude_decide(obs_dict: dict, valid_actions_dict: list[dict], agent_id
     # Build system prompt: base identity + loaded memory
     system = build_system_with_memory(memory_context)
 
-    response = await client.messages.create(
-        model="claude-opus-4-7-20250506",
+    response = await client.chat.completions.create(
+        model="gpt-4o",  # or whichever model is chosen
         max_tokens=1024,
-        system=system,
-        messages=[{"role": "user", "content": build_prompt(obs_dict, valid_actions_dict)}],
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": build_prompt(obs_dict, valid_actions_dict)},
+        ],
     )
 
     # Parse action + any memory updates the agent wants to make
@@ -655,10 +661,10 @@ For your poker action, respond with: ACTION: fold|check_or_call|raise <amount>""
   Hand Starts
        │
        ▼
-  Claude sees obs + loaded memory
+  GPT sees obs + loaded memory
        │
        ▼
-  Claude decides action + (optionally) writes memory updates
+  GPT decides action + (optionally) writes memory updates
        │
        ├──► Action applied to game
        │
@@ -671,7 +677,7 @@ For your poker action, respond with: ACTION: fold|check_or_call|raise <amount>""
        │
        ▼
   Post-hand reflection (optional activity):
-  Claude sees final result + full hand history
+  GPT sees final result + full hand history
   Writes learnings to memory (strategy adjustments, opponent reads)
 ```
 
@@ -679,13 +685,13 @@ For your poker action, respond with: ACTION: fold|check_or_call|raise <amount>""
 
 ```python
 @activity.defn
-async def claude_reflect(
+async def gpt_reflect(
     hand_result: dict,
     full_history: list[dict],
     agent_id: str,
 ) -> None:
-    """After a hand completes, give Claude a chance to reflect and update memory."""
-    client = anthropic.AsyncAnthropic()
+    """After a hand completes, give GPT a chance to reflect and update memory."""
+    client = AsyncOpenAI()
     memory_path = f"memory/agents/{agent_id}"
     memory_context = load_memory(memory_path)
 
@@ -706,14 +712,16 @@ Reflect on this hand. Update your memory with any learnings:
 
 Output memory updates as <memory_update> blocks."""
 
-    response = await client.messages.create(
-        model="claude-opus-4-7-20250506",
+    response = await client.chat.completions.create(
+        model="gpt-4o",  # or whichever model is chosen
         max_tokens=1024,
-        system=f"You are reflecting on a poker hand.\n\n<memory>\n{memory_context}\n</memory>",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {"role": "system", "content": f"You are reflecting on a poker hand.\n\n<memory>\n{memory_context}\n</memory>"},
+            {"role": "user", "content": prompt},
+        ],
     )
 
-    updates = parse_memory_updates(response.content[0].text)
+    updates = parse_memory_updates(response.choices[0].message.content)
     apply_memory_updates(memory_path, updates)
 ```
 
@@ -730,9 +738,9 @@ Output memory updates as <memory_update> blocks."""
 
 During the talk:
 - Show the empty `memory/agents/` folder
-- Start the first game — Claude bootstraps its own memory structure
-- After 5-10 hands, `ls` the memory folder — show files Claude created
-- Open a file like `opponent_models/human_player_0.md` — show Claude's reads on the audience member
+- Start the first game — GPT bootstraps its own memory structure
+- After 5-10 hands, `ls` the memory folder — show files GPT created
+- Open a file like `opponent_models/human_player_0.md` — show GPT's reads on the audience member
 - "The agent is writing its own playbook, in real-time, with no schema we defined"
 
 ---
@@ -795,10 +803,10 @@ async def main():
     client = await Client.connect("localhost:7233")
 
     human_env = PokerEnv(client, player_index=0)
-    claude_env = PokerEnv(client, player_index=1)
+    gpt_env = PokerEnv(client, player_index=1)
 
     human = HumanPlayer(player_index=0)
-    claude = ClaudePokerAgent(player_index=1)
+    gpt = GPTPokerAgent(player_index=1)
 
     session_stacks = [200, 200]
 
@@ -813,8 +821,8 @@ async def main():
         }
 
         obs = await human_env.reset(game_id=game_id, config=config)
-        # Claude connects to the same workflow
-        claude_env.handle = human_env.handle
+        # GPT connects to the same workflow
+        gpt_env.handle = human_env.handle
 
         while not obs.terminal:
             if obs.is_my_turn:
@@ -822,18 +830,18 @@ async def main():
                 action = await human.act(obs, valid)
                 obs, reward, done, info = await human_env.step(action)
             else:
-                # Claude's turn
-                claude_obs = await claude_env.observe()
-                valid = await claude_env.action_space()
-                action = await claude.act(claude_obs, valid)
-                await claude_env.step(action)
+                # GPT's turn
+                gpt_obs = await gpt_env.observe()
+                valid = await gpt_env.action_space()
+                action = await gpt.act(gpt_obs, valid)
+                await gpt_env.step(action)
                 # Refresh human view
                 obs = await human_env.observe()
 
         # Hand complete
         final = await human_env.observe()
         print(f"\n  Hand over! Your result: {'+' if final.payoff > 0 else ''}{final.payoff}")
-        print(f"  Stacks: You={final.stacks[0]}, Claude={final.stacks[1]}")
+        print(f"  Stacks: You={final.stacks[0]}, GPT={final.stacks[1]}")
 
         if input("\n  Play another hand? (y/n): ").strip().lower() != "y":
             break
@@ -873,7 +881,7 @@ random.seed(workflow.random().randint(0, 2**32))
 
 ### 1. Out-of-Turn Action Rejection
 
-**Problem**: The signal handler blindly queues any action. If Claude sends an action while the workflow waits for the human, that stale action sits in the queue and gets applied immediately on Claude's next turn — before Claude sees the updated board.
+**Problem**: The signal handler blindly queues any action. If GPT sends an action while the workflow waits for the human, that stale action sits in the queue and gets applied immediately on GPT's next turn — before GPT sees the updated board.
 
 **Fix**: Reject actions in the signal handler unless it's that player's turn.
 
@@ -913,7 +921,7 @@ def player_action(self, player_index: int, action: Action):
 
 ### 3. Turn Timeout Implementation
 
-**Problem**: If Claude's API hangs or the human walks away, the game is stuck forever.
+**Problem**: If the GPT API hangs or the human walks away, the game is stuck forever.
 
 **Fix**: Race `wait_condition` against a timer. Auto-fold on timeout.
 
@@ -960,7 +968,7 @@ async def run(self, config: dict):
 
 ### 4. Invalid Action Handling
 
-**Problem**: Claude might return an illegal raise amount or malformed action. PokerKit will throw an exception, crashing the workflow permanently.
+**Problem**: GPT might return an illegal raise amount or malformed action. PokerKit will throw an exception, crashing the workflow permanently.
 
 **Fix**: Wrap action application in try/except. On invalid action, re-wait for a valid one (with a retry limit before auto-fold).
 
@@ -1086,37 +1094,42 @@ async def _wait_for_turn(self) -> Observation:
 
 ---
 
-### 7. Claude Agent Resilience
+### 7. GPT Agent Resilience
 
-**Problem**: The Claude API can timeout, return 500s, or produce unparseable responses. The agent currently has no error handling.
+**Problem**: The OpenAI API can timeout, return 500s, or produce unparseable responses. The agent currently has no error handling.
 
 **Fix**: Retry with fallback.
 
 ```python
-class ClaudePokerAgent:
+class GPTPokerAgent:
     MAX_RETRIES = 2
     TIMEOUT = 10  # seconds
 
     async def act(self, obs: Observation, valid_actions: list[Action]) -> Action:
         for attempt in range(self.MAX_RETRIES + 1):
             try:
-                response = self.client.messages.create(
+                response = await self.client.chat.completions.create(
                     model=self.model,
                     max_tokens=256,
                     timeout=self.TIMEOUT,
-                    system="...",
-                    messages=[{"role": "user", "content": self._build_prompt(obs, valid_actions)}],
+                    messages=[
+                        {"role": "system", "content": "..."},
+                        {"role": "user", "content": self._build_prompt(obs, valid_actions)},
+                    ],
                 )
-                action = self._parse_response(response.content[0].text, valid_actions)
+                action = self._parse_response(response.choices[0].message.content, valid_actions)
                 # Validate the action is actually in the valid set
                 if action.type == "raise" and action.amount > 0:
                     valid_raise = any(a.type == "raise" for a in valid_actions)
                     if not valid_raise:
                         return Action("check_or_call")
                 return action
-            except (anthropic.APITimeoutError, anthropic.APIError) as e:
+            except Exception as e:
                 if attempt < self.MAX_RETRIES:
                     continue
+                # Final fallback: check/call is safe
+                return Action("check_or_call")
+```
                 # Final fallback: check/call is safe
                 return Action("check_or_call")
             except Exception:
@@ -1165,7 +1178,7 @@ Query it via CLI: `temporal workflow query --workflow-id poker-xxx --query-type 
 | Invalid action crashes     | Critical | Try/except + fallback |
 | Unbounded history          | Critical | Continue-as-new per hand |
 | Client polling overhead    | Medium   | Backoff (v1), push (v2) |
-| Claude API failures        | Medium   | Retry + fallback |
+| GPT API failures           | Medium   | Retry + fallback |
 | Debugging stuck games      | Medium   | Debug query  |
 | PokerKit RNG on replay     | Medium   | Needs verification |
 
@@ -1175,7 +1188,7 @@ Query it via CLI: `temporal workflow query --workflow-id poker-xxx --query-type 
 
 ### Overview
 
-A single-page React app connected to a FastAPI backend via WebSocket. Designed for live demos — the audience sees cards dealt, Claude "thinking", and real-time game progression.
+A single-page React app connected to a FastAPI backend via WebSocket. Designed for live demos — the audience sees cards dealt, GPT "thinking", and real-time game progression.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -1185,7 +1198,7 @@ A single-page React app connected to a FastAPI backend via WebSocket. Designed f
 │  │                         POKER TABLE                                    │  │
 │  │                                                                        │  │
 │  │          ┌─────────┐                        ┌─────────┐               │  │
-│  │          │ Claude   │                        │  Pot:   │               │  │
+│  │          │  GPT     │                        │  Pot:   │               │  │
 │  │          │ 🂠 🂠     │                        │  $42    │               │  │
 │  │          │ Stack:198│                        └─────────┘               │  │
 │  │          └─────────┘                                                   │  │
@@ -1212,7 +1225,7 @@ A single-page React app connected to a FastAPI backend via WebSocket. Designed f
 │  │  12:03:01  Signal: blinds posted (1/2)                                │  │
 │  │  12:03:01  Hole cards dealt                                           │  │
 │  │  12:03:03  Signal: player_action(0, raise 6)                          │  │
-│  │  12:03:04  Signal: player_action(1, check_or_call)  ← Claude          │  │
+│  │  12:03:04  Signal: player_action(1, check_or_call)  ← GPT             │  │
 │  │  12:03:04  Flop dealt: [A♠ 8♣ 9♦]                                    │  │
 │  │  ▼ streaming...                                                       │  │
 │  └────────────────────────────────────────────────────────────────────────┘  │
@@ -1237,14 +1250,14 @@ A single-page React app connected to a FastAPI backend via WebSocket. Designed f
                               └────────────────────┬───────────────────┘
                                                    │
                                           ┌────────▼────────┐
-                                          │  Claude Agent   │
+                                          │  GPT Agent      │
                                           │  (Activity)     │
                                           └─────────────────┘
 ```
 
-Key change: Claude runs as a **Temporal Activity** invoked by the workflow, not as an external client. This means:
-- The workflow controls Claude's turn directly (no second polling client)
-- Timeouts on Claude are handled by activity timeout, not a separate timer
+Key change: GPT runs as a **Temporal Activity** invoked by the workflow, not as an external client. This means:
+- The workflow controls GPT's turn directly (no second polling client)
+- Timeouts on GPT are handled by activity timeout, not a separate timer
 - The human is the only external client
 
 ---
@@ -1346,38 +1359,42 @@ def obs_to_dict(obs: Observation) -> dict:
 
 ---
 
-### Claude as Activity (not external client)
+### GPT as Activity (not external client)
 
-Moving Claude from an external polling client to a workflow activity simplifies the architecture significantly:
+Moving GPT from an external polling client to a workflow activity simplifies the architecture significantly:
 
 ```python
-from temporalio import activity
-import anthropic
+from openai import AsyncOpenAI
 
 
 @activity.defn
-async def claude_decide(obs_dict: dict, valid_actions_dict: list[dict]) -> dict:
-    """Activity: ask Claude for a poker decision."""
-    client = anthropic.AsyncAnthropic()
+async def gpt_decide(obs_dict: dict, valid_actions_dict: list[dict]) -> dict:
+    """Activity: ask GPT for a poker decision."""
+    client = AsyncOpenAI()
 
     prompt = _build_prompt(obs_dict, valid_actions_dict)
 
-    response = await client.messages.create(
-        model="claude-opus-4-7-20250506",
+    response = await client.chat.completions.create(
+        model="gpt-4o",  # or whichever model is chosen
         max_tokens=256,
-        system=(
-            "You are an expert poker player. Analyze the situation and "
-            "choose the optimal action. Respond with ONLY one of: "
-            "fold | check_or_call | raise <amount>"
-        ),
-        messages=[{"role": "user", "content": prompt}],
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are an expert poker player. Analyze the situation and "
+                    "choose the optimal action. Respond with ONLY one of: "
+                    "fold | check_or_call | raise <amount>"
+                ),
+            },
+            {"role": "user", "content": prompt},
+        ],
     )
 
-    text = response.content[0].text.strip().lower()
+    text = response.choices[0].message.content.strip().lower()
     return _parse_to_dict(text, valid_actions_dict)
 ```
 
-In the workflow, Claude's turn becomes:
+In the workflow, GPT's turn becomes:
 
 ```python
 while self.state.status:
@@ -1386,12 +1403,12 @@ while self.state.status:
         break
 
     if actor == CLAUDE_INDEX:
-        # Claude decides via activity (with timeout)
+        # GPT decides via activity (with timeout)
         obs_dict = self._build_obs_dict(actor)
         valid_dict = self._build_valid_actions_dict(actor)
         try:
             action_dict = await workflow.execute_activity(
-                claude_decide,
+                gpt_decide,
                 args=[obs_dict, valid_dict],
                 start_to_close_timeout=timedelta(seconds=15),
                 retry_policy=RetryPolicy(maximum_attempts=2),
@@ -1424,7 +1441,7 @@ frontend/
 │   ├── components/
 │   │   ├── PokerTable.tsx      # Table layout, community cards
 │   │   ├── PlayerHand.tsx      # Hole cards display
-│   │   ├── OpponentHand.tsx    # Face-down cards for Claude
+│   │   ├── OpponentHand.tsx    # Face-down cards for GPT
 │   │   ├── ActionPanel.tsx     # Fold/Call/Raise buttons + slider
 │   │   ├── PotDisplay.tsx      # Pot amount, side pots
 │   │   ├── EventLog.tsx        # Temporal event stream panel
@@ -1507,7 +1524,7 @@ export function ActionPanel({ observation, onAction }: Props) {
   const { is_my_turn, current_bet, min_raise, max_raise } = observation;
 
   if (!is_my_turn) {
-    return <div className="action-panel waiting">Waiting for Claude...</div>;
+    return <div className="action-panel waiting">Waiting for GPT...</div>;
   }
 
   return (
@@ -1549,7 +1566,7 @@ export function ActionPanel({ observation, onAction }: Props) {
 | Feature                     | Why it matters for the demo                         |
 |-----------------------------|-----------------------------------------------------|
 | Live event log panel        | Shows Temporal events streaming in real-time        |
-| Claude "thinking" indicator | Spinner while activity runs, shows AI deliberation  |
+| GPT "thinking" indicator  | Spinner while activity runs, shows AI deliberation  |
 | Card deal animations        | CSS transitions on new cards appearing              |
 | Workflow ID visible         | Audience can see it's a real Temporal workflow       |
 | "Kill worker" button        | Demo durability: kill worker, restart, game resumes |
@@ -1576,7 +1593,7 @@ poker_temporal/
 ├── workflow/
 │   ├── __init__.py
 │   ├── poker_workflow.py      # Temporal workflow wrapping PokerKit
-│   ├── activities.py          # Claude decision activity
+│   ├── activities.py          # GPT decision activity
 │   └── types.py               # Observation, Action, ActionRecord
 ├── env/
 │   ├── __init__.py
@@ -1616,7 +1633,7 @@ poker_temporal/
 ```
 # Backend
 temporalio>=1.7.0
-anthropic>=0.40.0
+openai>=1.0.0
 pokerkit>=0.5.0
 fastapi>=0.110.0
 uvicorn>=0.27.0
@@ -1634,7 +1651,7 @@ react, react-dom, vite, typescript
 # Terminal 1: Temporal dev server
 temporal server start-dev
 
-# Terminal 2: Worker (runs workflow + Claude activity)
+# Terminal 2: Worker (runs workflow + GPT activity)
 python worker.py
 
 # Terminal 3: FastAPI backend
