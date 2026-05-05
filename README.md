@@ -24,37 +24,59 @@ Browser (React) ←── WebSocket ──→ FastAPI Server ←── Temporal 
 - Python 3.11+
 - Node.js 18+
 - [Temporal CLI](https://docs.temporal.io/cli#install)
-- [uv](https://github.com/astral-sh/uv) (recommended) or pip
+- tmux
 - OpenAI API key
+
+On Debian/Ubuntu/WSL, install the Python venv package if it is not already present:
+
+```bash
+sudo apt install python3.12-venv
+```
 
 ## Setup
 
 ```bash
 cd poker_temporal
 
-# Python environment
-uv venv --python 3.11
-source .venv/bin/activate
-uv pip install -r requirements.txt
-
 # Frontend
 cd frontend
 npm install
 cd ..
-
-# Environment variables
-cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
 ```
 
-Create a `.env` file in `poker_temporal/`:
+`start.sh` creates or repairs `poker_temporal/.venv` automatically, upgrades pip, and installs `requirements.txt` when dependencies are missing. It also prompts for your OpenAI API key on first run and saves it to `poker_temporal/.env`.
+
+You can also create `.env` yourself:
+
 ```
 OPENAI_API_KEY=sk-your-key-here
 ```
 
 ## Running
 
-You need 4 terminals:
+From the repo root:
+
+```bash
+./start.sh
+```
+
+The script starts all services in a tmux session named `poker`:
+
+- Temporal dev server
+- Temporal worker
+- FastAPI server
+- Vite frontend
+
+Open **http://localhost:5173** and click "New Game".
+
+Useful tmux commands:
+
+```bash
+tmux attach -t poker
+tmux kill-session -t poker
+```
+
+If you prefer to run services manually, use 4 terminals:
 
 **Terminal 1 — Temporal Server**
 ```bash
@@ -80,8 +102,6 @@ uvicorn server.app:app --reload --port 8000
 cd poker_temporal/frontend
 npm run dev
 ```
-
-Open **http://localhost:5173** and click "New Game".
 
 ## CLI Mode (no UI)
 
@@ -207,4 +227,3 @@ Every GPT decision (with its memory updates) is recorded as an activity result i
 | Crash recovery | Custom replay logic + checkpointing | Deterministic replay (automatic) |
 | Multi-hand sessions | State checkpointing + cleanup jobs | `continue_as_new` |
 | **Total extra infrastructure** | **5-6 additional services** | **None** |
-
