@@ -535,8 +535,8 @@ memory/
 │  Agent starts up                                                 │
 │                                                                  │
 │  ┌──────────────────┐     YES     ┌──────────────────────────┐ │
-│  │ Is memory folder  │───────────►│ Load existing memory      │ │
-│  │ populated?        │            │ Include in system prompt  │ │
+│  │ Is memory folder  │───────────►│ Expose memory tools       │ │
+│  │ populated?        │            │ Let model inspect files   │ │
 │  └──────────────────┘            └──────────────────────────┘ │
 │          │ NO                                                    │
 │          ▼                                                       │
@@ -577,65 +577,83 @@ But this is **not prescribed** — the agent creates whatever structure helps it
 ### Integration with the Workflow
 
 ```python
+async def claude_agent_turn(
+    obs_dict: dict,
+    valid_actions_dict: list[dict],
+    agent_id: str,
+) -> dict:
+    """Workflow helper: run the model/tool loop until Claude returns an action."""
+    messages = [{"role": "user", "content": build_prompt(obs_dict, valid_actions_dict)}]
+
+    await workflow.execute_activity(ensure_memory_root, agent_id)
+
+    while True:
+        step = await workflow.execute_activity(
+            claude_step,
+            args=[agent_id, messages],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        if step["type"] == "action":
+            return step["action"]
+
+        tool_call = step["tool_call"]
+        tool_result = await execute_memory_tool(agent_id, tool_call)
+        messages.append(step["assistant_message"])
+        messages.append({
+            "role": "user",
+            "content": make_tool_result(tool_call["id"], tool_result),
+        })
+
+
+async def execute_memory_tool(agent_id: str, tool_call: dict) -> dict | str | None:
+    """Map Claude's memory tool call to the corresponding Temporal activity."""
+    if tool_call["name"] == "memory_list":
+        return await workflow.execute_activity(memory_list, args=[agent_id, tool_call["path"]])
+    if tool_call["name"] == "memory_read":
+        return await workflow.execute_activity(memory_read, args=[agent_id, tool_call["path"]])
+    if tool_call["name"] == "memory_write":
+        return await workflow.execute_activity(
+            memory_write,
+            args=[agent_id, tool_call["path"], tool_call["content"]],
+        )
+    if tool_call["name"] == "memory_edit":
+        return await workflow.execute_activity(
+            memory_edit,
+            args=[agent_id, tool_call["path"], tool_call["patch"]],
+        )
+    raise ValueError(f"Unknown memory tool: {tool_call['name']}")
+
+
 @activity.defn
-async def claude_decide(obs_dict: dict, valid_actions_dict: list[dict], agent_id: str) -> dict:
-    """Activity: ask Claude for a poker decision, with memory."""
+async def claude_step(agent_id: str, messages: list[dict]) -> dict:
+    """Call Claude once. It returns either a poker action or a requested tool call."""
     client = anthropic.AsyncAnthropic()
     memory_path = f"memory/agents/{agent_id}"
 
-    # Load memory into context
-    memory_context = load_memory(memory_path)
-
-    # Build system prompt: base identity + loaded memory
-    system = build_system_with_memory(memory_context)
-
     response = await client.messages.create(
         model="claude-opus-4-7-20250506",
-        max_tokens=1024,
-        system=system,
-        messages=[{"role": "user", "content": build_prompt(obs_dict, valid_actions_dict)}],
+        max_tokens=2048,
+        system=build_system_prompt(memory_path),
+        tools=memory_tools(),
+        messages=messages,
     )
 
-    # Parse action + any memory updates the agent wants to make
-    result = parse_response(response)
-
-    # Agent can request memory writes as part of its response
-    if result.memory_updates:
-        apply_memory_updates(memory_path, result.memory_updates)
-
-    return result.action
+    return parse_action_or_tool_call(response)
 
 
-def load_memory(path: str) -> str:
-    """Load all memory files into a context string."""
-    if not os.path.exists(path) or not os.listdir(path):
-        return "MEMORY_EMPTY: Define your memory structure."
-
-    context_parts = []
-    for root, dirs, files in os.walk(path):
-        for f in files:
-            filepath = os.path.join(root, f)
-            rel_path = os.path.relpath(filepath, path)
-            content = open(filepath).read()
-            context_parts.append(f"[{rel_path}]\n{content}")
-    return "\n---\n".join(context_parts)
-
-
-def build_system_with_memory(memory_context: str) -> str:
+def build_system_prompt(memory_root: str) -> str:
     return f"""You are a poker agent. Your objective is to get better at poker
 by playing and observing games.
 
-You have a persistent memory system. Your current memory:
+You have a persistent file-system memory rooted at:
+{memory_root}
 
-<memory>
-{memory_context}
-</memory>
-
-After each decision, you may output memory updates in this format:
-<memory_update>
-WRITE path/to/file.md
-content here
-</memory_update>
+Memory is not preloaded into your context. Use tools to explore it when useful:
+- memory_list: list files and directories under your memory root
+- memory_read: read a specific memory file
+- memory_write: create or replace a memory file
+- memory_edit: apply targeted edits to an existing memory file
 
 Use memory to:
 - Track opponent tendencies
@@ -644,51 +662,116 @@ Use memory to:
 - Build your own mental model over time
 
 If your memory is empty, first define your memory structure by writing
-your SYSTEM_PROMPT.md and any initial files you need.
+SYSTEM_PROMPT.md and any initial files you need. Prefer targeted edits for
+incremental updates so you preserve useful context already in the file.
 
 For your poker action, respond with: ACTION: fold|check_or_call|raise <amount>"""
 ```
 
-### Memory Update Flow (per hand)
+### Memory Tool Activities
+
+Memory access is implemented as activities rather than direct workflow I/O. The
+workflow runs the Claude tool loop: a model-call activity asks for a tool, the
+workflow executes the matching memory activity, and the next model-call activity
+receives the tool result.
+
+```python
+@activity.defn
+async def ensure_memory_root(agent_id: str) -> None:
+    """Create memory/agents/{agent_id}/ if this is the first run."""
+    agent_memory_root(agent_id).mkdir(parents=True, exist_ok=True)
+
+
+@activity.defn
+async def memory_list(agent_id: str, path: str = ".") -> list[dict]:
+    """List files and directories under memory/agents/{agent_id}/path."""
+    root = agent_memory_root(agent_id)
+    target = safe_join(root, path)
+    return [
+        {
+            "path": os.path.relpath(entry.path, root),
+            "type": "dir" if entry.is_dir() else "file",
+            "size": entry.stat().st_size if entry.is_file() else None,
+        }
+        for entry in os.scandir(target)
+    ]
+
+
+@activity.defn
+async def memory_read(agent_id: str, path: str) -> str:
+    """Read one memory file. The model asks for only the files it needs."""
+    root = agent_memory_root(agent_id)
+    return Path(safe_join(root, path)).read_text()
+
+
+@activity.defn
+async def memory_write(agent_id: str, path: str, content: str) -> None:
+    """Create or replace one memory file."""
+    root = agent_memory_root(agent_id)
+    target = Path(safe_join(root, path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+
+
+@activity.defn
+async def memory_edit(agent_id: str, path: str, patch: str) -> None:
+    """Apply a targeted model-authored edit to one memory file.
+
+    The patch can use the same style of structured file edit a coding model is
+    already good at producing: find/replace hunks, append blocks, or a unified
+    diff. The activity validates the target path, applies the edit, and fails
+    cleanly if the patch does not match the current file.
+    """
+    root = agent_memory_root(agent_id)
+    target = Path(safe_join(root, path))
+    original = target.read_text()
+    updated = apply_model_patch(original, patch)
+    target.write_text(updated)
+```
+
+The model can therefore use its natural file-editing ability without being
+trusted with arbitrary filesystem access. Every operation is scoped to
+`memory/agents/{agent_id}/`, logged as an activity result, and available for
+retry/error handling.
+
+### Memory Access Flow (per hand)
 
 ```
   Hand Starts
        │
        ▼
-  Claude sees obs + loaded memory
+  Claude sees obs + memory tool descriptions
        │
        ▼
-  Claude decides action + (optionally) writes memory updates
+  Claude lists/reads only relevant memory files
+       │
+       ▼
+  Claude decides action + (optionally) writes or edits memory
        │
        ├──► Action applied to game
        │
-       └──► Memory updates written to filesystem
+       └──► Memory activities persist writes/targeted edits
                 │
                 ▼
-  Next decision: memory is reloaded (includes new writes)
+  Next decision: Claude can inspect the updated filesystem memory
 
   Hand Ends
        │
        ▼
   Post-hand reflection (optional activity):
   Claude sees final result + full hand history
-  Writes learnings to memory (strategy adjustments, opponent reads)
+  Uses memory tools to update strategy notes, opponent reads, and mistakes
 ```
 
-### Post-Hand Reflection Activity
+### Post-Hand Reflection Flow
 
 ```python
-@activity.defn
 async def claude_reflect(
     hand_result: dict,
     full_history: list[dict],
     agent_id: str,
 ) -> None:
-    """After a hand completes, give Claude a chance to reflect and update memory."""
-    client = anthropic.AsyncAnthropic()
-    memory_path = f"memory/agents/{agent_id}"
-    memory_context = load_memory(memory_path)
-
+    """Workflow helper: after a hand, let Claude inspect and update memory."""
     prompt = f"""The hand just completed. Here's what happened:
 
 Result: {"Won" if hand_result["payoff"] > 0 else "Lost"} {abs(hand_result["payoff"])} chips
@@ -704,17 +787,28 @@ Reflect on this hand. Update your memory with any learnings:
 - What did you learn about your opponent?
 - Any strategic adjustments for next time?
 
-Output memory updates as <memory_update> blocks."""
+Use memory_list and memory_read to inspect relevant notes. Use memory_write for
+new files and memory_edit for targeted updates to existing files."""
 
-    response = await client.messages.create(
-        model="claude-opus-4-7-20250506",
-        max_tokens=1024,
-        system=f"You are reflecting on a poker hand.\n\n<memory>\n{memory_context}\n</memory>",
-        messages=[{"role": "user", "content": prompt}],
-    )
+    messages = [{"role": "user", "content": prompt}]
 
-    updates = parse_memory_updates(response.content[0].text)
-    apply_memory_updates(memory_path, updates)
+    while True:
+        step = await workflow.execute_activity(
+            claude_step,
+            args=[agent_id, messages],
+            start_to_close_timeout=timedelta(seconds=30),
+        )
+
+        if step["type"] == "done":
+            return
+
+        tool_call = step["tool_call"]
+        tool_result = await execute_memory_tool(agent_id, tool_call)
+        messages.append(step["assistant_message"])
+        messages.append({
+            "role": "user",
+            "content": make_tool_result(tool_call["id"], tool_result),
+        })
 ```
 
 ### Why File System
