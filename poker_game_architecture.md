@@ -507,6 +507,236 @@ What is your action?"""
 
 ---
 
+## Agent Memory (Self-Organizing)
+
+The Claude agent has a **file-system-based memory** that it owns and structures itself. The objective: get better at poker by playing and observing games over time.
+
+### Design Principles
+
+1. **Agent-defined structure** — The agent decides how to organize its memory (not hardcoded by us)
+2. **Bootstrap from empty** — If the memory folder is empty, the agent defines its own schema on first run
+3. **Learning objective** — Get better at poker by playing and observing
+4. **Persistent across sessions** — Memory survives between hands, games, and restarts
+
+### File System Layout
+
+```
+memory/
+└── agents/
+    └── {AGENT_NAME_ID}/           # e.g., "claude-A8CD3/"
+        ├── SYSTEM_PROMPT.md       # Agent's self-defined identity + goals
+        └── ... (agent-defined)    # Agent creates its own structure below
+```
+
+### Bootstrap Flow
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Agent starts up                                                 │
+│                                                                  │
+│  ┌──────────────────┐     YES     ┌──────────────────────────┐ │
+│  │ Is memory folder  │───────────►│ Load existing memory      │ │
+│  │ populated?        │            │ Include in system prompt  │ │
+│  └──────────────────┘            └──────────────────────────┘ │
+│          │ NO                                                    │
+│          ▼                                                       │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │ Define memory structure:                                  │   │
+│  │  - What categories to track                               │   │
+│  │  - What file structure to use                             │   │
+│  │  - What to observe and record                             │   │
+│  │  - Write SYSTEM_PROMPT.md with objectives                 │   │
+│  └──────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Example: Agent-Defined Memory Structure
+
+On first run, the agent might create something like:
+
+```
+memory/agents/claude-A8CD3/
+├── SYSTEM_PROMPT.md              # "I am a poker agent. My goal is to..."
+├── strategy/
+│   ├── preflop_ranges.md         # Opening hand ranges by position
+│   ├── bet_sizing.md             # Learned bet sizing patterns
+│   └── bluff_frequency.md        # When bluffs worked vs didn't
+├── opponent_models/
+│   ├── human_player_0.md         # Tendencies: "calls too much, rarely 3-bets"
+│   └── patterns.md               # General reads
+├── hand_history/
+│   ├── notable_hands.md          # Hands worth remembering (big pots, bad beats)
+│   └── mistakes.md               # Hands where outcome was bad + analysis
+└── meta/
+    ├── session_stats.md           # Win rate, hands played, profit/loss
+    └── learnings.md               # High-level strategic adjustments
+```
+
+But this is **not prescribed** — the agent creates whatever structure helps it improve.
+
+### Integration with the Workflow
+
+```python
+@activity.defn
+async def claude_decide(obs_dict: dict, valid_actions_dict: list[dict], agent_id: str) -> dict:
+    """Activity: ask Claude for a poker decision, with memory."""
+    client = anthropic.AsyncAnthropic()
+    memory_path = f"memory/agents/{agent_id}"
+
+    # Load memory into context
+    memory_context = load_memory(memory_path)
+
+    # Build system prompt: base identity + loaded memory
+    system = build_system_with_memory(memory_context)
+
+    response = await client.messages.create(
+        model="claude-opus-4-7-20250506",
+        max_tokens=1024,
+        system=system,
+        messages=[{"role": "user", "content": build_prompt(obs_dict, valid_actions_dict)}],
+    )
+
+    # Parse action + any memory updates the agent wants to make
+    result = parse_response(response)
+
+    # Agent can request memory writes as part of its response
+    if result.memory_updates:
+        apply_memory_updates(memory_path, result.memory_updates)
+
+    return result.action
+
+
+def load_memory(path: str) -> str:
+    """Load all memory files into a context string."""
+    if not os.path.exists(path) or not os.listdir(path):
+        return "MEMORY_EMPTY: Define your memory structure."
+
+    context_parts = []
+    for root, dirs, files in os.walk(path):
+        for f in files:
+            filepath = os.path.join(root, f)
+            rel_path = os.path.relpath(filepath, path)
+            content = open(filepath).read()
+            context_parts.append(f"[{rel_path}]\n{content}")
+    return "\n---\n".join(context_parts)
+
+
+def build_system_with_memory(memory_context: str) -> str:
+    return f"""You are a poker agent. Your objective is to get better at poker
+by playing and observing games.
+
+You have a persistent memory system. Your current memory:
+
+<memory>
+{memory_context}
+</memory>
+
+After each decision, you may output memory updates in this format:
+<memory_update>
+WRITE path/to/file.md
+content here
+</memory_update>
+
+Use memory to:
+- Track opponent tendencies
+- Record strategic learnings
+- Note mistakes and adjustments
+- Build your own mental model over time
+
+If your memory is empty, first define your memory structure by writing
+your SYSTEM_PROMPT.md and any initial files you need.
+
+For your poker action, respond with: ACTION: fold|check_or_call|raise <amount>"""
+```
+
+### Memory Update Flow (per hand)
+
+```
+  Hand Starts
+       │
+       ▼
+  Claude sees obs + loaded memory
+       │
+       ▼
+  Claude decides action + (optionally) writes memory updates
+       │
+       ├──► Action applied to game
+       │
+       └──► Memory updates written to filesystem
+                │
+                ▼
+  Next decision: memory is reloaded (includes new writes)
+
+  Hand Ends
+       │
+       ▼
+  Post-hand reflection (optional activity):
+  Claude sees final result + full hand history
+  Writes learnings to memory (strategy adjustments, opponent reads)
+```
+
+### Post-Hand Reflection Activity
+
+```python
+@activity.defn
+async def claude_reflect(
+    hand_result: dict,
+    full_history: list[dict],
+    agent_id: str,
+) -> None:
+    """After a hand completes, give Claude a chance to reflect and update memory."""
+    client = anthropic.AsyncAnthropic()
+    memory_path = f"memory/agents/{agent_id}"
+    memory_context = load_memory(memory_path)
+
+    prompt = f"""The hand just completed. Here's what happened:
+
+Result: {"Won" if hand_result["payoff"] > 0 else "Lost"} {abs(hand_result["payoff"])} chips
+Final board: {hand_result["board"]}
+Your hand: {hand_result["hole_cards"]}
+Opponent hand: {hand_result.get("opponent_cards", "unknown (mucked)")}
+
+Full action history:
+{format_history(full_history)}
+
+Reflect on this hand. Update your memory with any learnings:
+- Did you make any mistakes?
+- What did you learn about your opponent?
+- Any strategic adjustments for next time?
+
+Output memory updates as <memory_update> blocks."""
+
+    response = await client.messages.create(
+        model="claude-opus-4-7-20250506",
+        max_tokens=1024,
+        system=f"You are reflecting on a poker hand.\n\n<memory>\n{memory_context}\n</memory>",
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    updates = parse_memory_updates(response.content[0].text)
+    apply_memory_updates(memory_path, updates)
+```
+
+### Why File System
+
+| Alternative         | Why FS is better for this demo                          |
+|---------------------|--------------------------------------------------------|
+| Database            | Overkill; agent can't define its own schema easily     |
+| Vector store        | Good for retrieval but agent can't browse/organize     |
+| In-memory dict      | Lost on restart; not inspectable                       |
+| **File system**     | Agent reads/writes naturally; human can inspect; persists; agent defines structure |
+
+### Demo Impact
+
+During the talk:
+- Show the empty `memory/agents/` folder
+- Start the first game — Claude bootstraps its own memory structure
+- After 5-10 hands, `ls` the memory folder — show files Claude created
+- Open a file like `opponent_models/human_player_0.md` — show Claude's reads on the audience member
+- "The agent is writing its own playbook, in real-time, with no schema we defined"
+
+---
+
 ## Human Player (CLI)
 
 ```python
