@@ -3,16 +3,30 @@ set -e
 
 SESSION="poker"
 PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)/poker_temporal"
+VENV_PYTHON="$PROJECT_DIR/.venv/bin/python"
 
 # Check prerequisites
 command -v temporal >/dev/null 2>&1 || { echo "Error: temporal CLI not found. Install from https://docs.temporal.io/cli#install"; exit 1; }
 command -v tmux >/dev/null 2>&1 || { echo "Error: tmux not found. Install with: brew install tmux"; exit 1; }
 command -v node >/dev/null 2>&1 || { echo "Error: node not found. Install Node.js 18+"; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "Error: python3 not found. Install Python 3.11+"; exit 1; }
 
-# Check Python venv exists
-if [ ! -d "$PROJECT_DIR/.venv" ]; then
-    echo "Error: Python venv not found. Run: cd poker_temporal && uv venv --python 3.11 && uv pip install -r requirements.txt"
-    exit 1
+# Create Python venv if needed
+if [ ! -x "$VENV_PYTHON" ] || ! "$VENV_PYTHON" -m pip --version >/dev/null 2>&1; then
+    echo "Python venv not found or incomplete. Creating $PROJECT_DIR/.venv..."
+    if ! python3 -m venv --clear "$PROJECT_DIR/.venv"; then
+        echo ""
+        echo "Error: Python could not create a virtualenv because ensurepip is unavailable."
+        echo "On Debian/Ubuntu/WSL, install it with: sudo apt install python3.12-venv"
+        exit 1
+    fi
+    "$VENV_PYTHON" -m pip install --upgrade pip
+fi
+
+# Install Python dependencies if the venv is new or was left partially installed.
+if ! "$VENV_PYTHON" -c "import temporalio, openai, dotenv, pokerkit, fastapi, uvicorn, websockets" >/dev/null 2>&1; then
+    echo "Installing Python dependencies..."
+    "$VENV_PYTHON" -m pip install -r "$PROJECT_DIR/requirements.txt"
 fi
 
 # Check frontend node_modules
