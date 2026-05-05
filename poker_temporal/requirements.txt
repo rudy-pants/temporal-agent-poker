@@ -1,0 +1,6 @@
+temporalio>=1.7.0,<2.0.0
+openai>=1.0.0
+pokerkit>=0.5.0,<1.0.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+websockets>=12.0
